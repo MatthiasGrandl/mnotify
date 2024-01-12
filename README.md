@@ -1,4 +1,20 @@
-# mnotify
+# mnotify personal fork
+
+This is a heavily modified fork of [mnotify](https://github.com/rumpelsepp/mnotify) for strictly personal use.
+
+Changes:
+- Updated dependencies
+- Sliding Sync
+- Cross-signing user identities
+- Implemented the sqlite store for persistance
+- The sync command creates a unix socket which broadcasts the room list to anyone who wants to listen (yolo)
+- This unix socket offers a minimal API to write messages/reply and subscribe to rooms
+
+On top of that I am a complete Rust beginner and this code is absolutely disgusting, so I am not even trying to upstream any of what I am doing here.
+I did this as a learning project and to integrate a minimal matrix client into my Raycast setup.
+
+
+---
 
 ATTENTION: Currently under development; expect breakage.
 
