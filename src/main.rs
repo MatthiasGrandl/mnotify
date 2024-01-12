@@ -4,19 +4,14 @@ use std::path::PathBuf;
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::Verbosity;
+
 use futures::StreamExt;
-use matrix_sdk::config::SyncSettings;
-use matrix_sdk::deserialized_responses::SyncTimelineEvent;
-use matrix_sdk::room::Room;
-use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
-use matrix_sdk::ruma::events::receipt::ReceiptThread;
 use matrix_sdk::ruma::presence::PresenceState;
-use matrix_sdk::ruma::{events::AnySyncTimelineEvent, serde::Raw};
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+
 use serde::Serialize;
 use serde_json::value::RawValue;
 
-mod base64;
 mod client;
 mod mime;
 mod outputs;
@@ -139,18 +134,7 @@ enum Command {
         message: Option<String>,
     },
     /// Run sync and print all events
-    Sync {
-        #[arg(long)]
-        room_id: Option<OwnedRoomId>,
-
-        /// Mark all received messages as read
-        #[arg(long)]
-        receipt: bool,
-
-        /// Print raw sync events as they come
-        #[arg(long)]
-        raw: bool,
-    },
+    Sync,
     /// Send typing notifications
     Typing {
         #[arg(long, required = true)]
@@ -164,37 +148,6 @@ enum Command {
     Verify {},
     /// Ask the homeserver who we are
     Whoami,
-}
-
-impl Command {
-    fn can_sync(&self) -> bool {
-        !matches!(
-            self,
-            Command::Clean { .. } | Command::Login { .. } | Command::Sync { .. }
-        )
-    }
-}
-
-async fn on_room_message(
-    event: Raw<AnySyncTimelineEvent>,
-    room: Room,
-    receipt: bool,
-) -> anyhow::Result<()> {
-    let Room::Joined(room) = room else {return Ok(())};
-
-    let raw_json = event.clone().into_json();
-    let parsed_event: SyncTimelineEvent = event.into();
-    let event_id = parsed_event.event_id();
-
-    if receipt {
-        if let Some(event_id) = event_id {
-            room.send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
-                .await?;
-        }
-    }
-
-    println!("{}", raw_json);
-    Ok(())
 }
 
 async fn create_client(cmd: &Command) -> anyhow::Result<Client> {
@@ -218,9 +171,6 @@ async fn create_client(cmd: &Command) -> anyhow::Result<Client> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
-    let sync_settings = SyncSettings::default()
-        .full_state(args.full_state)
-        .set_presence(args.presense);
 
     tracing_subscriber::fmt()
         .with_max_level(util::convert_filter(args.verbose.log_level_filter()))
@@ -228,9 +178,14 @@ async fn main() -> anyhow::Result<()> {
 
     let client = create_client(&args.command).await?;
 
-    if args.command.can_sync() {
-        client.sync_once(sync_settings.clone()).await?;
-    }
+    match client.clone().sliding_sync {
+        Some(s) => {
+            let sync = s.sync();
+            let mut sync_stream = Box::pin(sync);
+            sync_stream.next().await;
+        }
+        None => {}
+    };
 
     match args.command {
         Command::Clean { .. } => {
@@ -240,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             force,
             include_token,
         } => {
-            let home_server = client.homeserver().await.to_string();
+            let home_server = client.homeserver().to_string();
             let user_id = client.user_id().unwrap().to_string();
 
             #[derive(Serialize)]
@@ -355,8 +310,20 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
         }
         Command::Verify {} => {
+            let enc = client.encryption();
+
+            let _e = enc.bootstrap_cross_signing_if_needed(None).await;
+
+            eprintln!("{:#?}", enc.cross_signing_status().await);
+            match enc.get_user_identity(client.user_id().unwrap()).await? {
+                Some(id) => {
+                    eprintln!("{:#?}", id.is_verified());
+                    //let _v = id.request_verification().await;
+                }
+                None => {}
+            }
             client.set_sas_handlers().await?;
-            client.sync(sync_settings.clone()).await?;
+            client.socket().await?;
         }
         Command::Send {
             room_id,
@@ -390,30 +357,8 @@ async fn main() -> anyhow::Result<()> {
                 client.send_message(room_id, &body, markdown).await?;
             }
         }
-        Command::Sync {
-            room_id,
-            receipt,
-            raw,
-        } => {
-            if raw {
-                let mut sync_stream = Box::pin(client.sync_stream(sync_settings.clone()).await);
-                while let Some(Ok(response)) = sync_stream.next().await {
-                    let resp: outputs::SyncResponse = response.into();
-                    println!("{}", serde_json::to_string(&resp)?);
-                }
-            } else {
-                if let Some(ref room_id) = room_id {
-                    client.add_room_event_handler(room_id, move |event, room| async move {
-                        on_room_message(event, room, receipt).await
-                    });
-                } else {
-                    client.add_event_handler(move |event, room| async move {
-                        on_room_message(event, room, receipt).await
-                    });
-                }
-
-                client.sync(sync_settings.clone()).await?;
-            }
+        Command::Sync => {
+            client.socket().await?;
         }
         Command::Typing { room_id, disable } => {
             let room = client.get_joined_room(room_id)?;

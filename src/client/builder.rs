@@ -1,9 +1,12 @@
 use std::env;
 
 use anyhow::anyhow;
-use matrix_sdk::ruma::OwnedUserId;
-use matrix_sdk::Client as MatrixClient;
+use matrix_sdk::ruma::api::client::sync::sync_events::v4::SyncRequestListFilters;
+use matrix_sdk::ruma::events::{StateEventType, TimelineEventType};
+use matrix_sdk::{ruma::OwnedUserId, SlidingSyncList};
+use matrix_sdk::{Client as MatrixClient, SlidingSyncMode};
 
+use super::session::state_db_path;
 use super::{session, Client};
 use crate::CRATE_NAME;
 
@@ -37,9 +40,11 @@ impl ClientBuilder {
             panic!("no device name set");
         };
 
+        let state_path = state_db_path(user_id.clone())?;
+
         let mut builder = MatrixClient::builder()
             .server_name(user_id.server_name())
-            .sled_store(session::state_db_path(&user_id)?, None);
+            .sqlite_store(state_path, None);
 
         if let Ok(proxy) = env::var("HTTPS_PROXY") {
             builder = builder.proxy(proxy);
@@ -49,13 +54,47 @@ impl ClientBuilder {
             builder = builder.disable_ssl_verification();
         }
 
-        let client = Client {
+        let mut client = Client {
             inner: builder.build().await?,
             user_id,
             device_name,
+            sliding_sync: None,
         };
 
         client.connect().await?;
+
+        // disable sync if we're not logged in
+        if !client.logged_in() {
+            return Ok(client);
+        }
+
+        let mut filter = SyncRequestListFilters::default();
+        filter.not_room_types = vec![String::from("m.space")];
+
+        let list = SlidingSyncList::builder("list")
+            .sync_mode(SlidingSyncMode::Growing {
+                batch_size: (20),
+                maximum_number_of_rooms_to_fetch: Some(200),
+            })
+            .bump_event_types(&[TimelineEventType::RoomMessage])
+            .filters(Some(filter))
+            .timeline_limit(1)
+            .sort(vec![String::from("by_recency")])
+            .required_state(vec![
+                (StateEventType::RoomAvatar, String::from("")),
+                (StateEventType::RoomTopic, String::from("")),
+            ]);
+
+        let sliding_sync = client
+            .inner
+            .sliding_sync("sync")?
+            .add_cached_list(list)
+            .await?
+            .with_all_extensions()
+            .build()
+            .await?;
+
+        client.sliding_sync = Some(sliding_sync);
 
         Ok(client)
     }

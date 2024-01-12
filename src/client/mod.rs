@@ -1,7 +1,7 @@
 use std::ops::Deref;
 
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
-use matrix_sdk::Client as MatrixClient;
+use matrix_sdk::{Client as MatrixClient, SlidingSync};
 use serde::Serialize;
 
 use crate::CRATE_NAME;
@@ -11,6 +11,7 @@ pub mod login;
 pub mod room;
 pub mod sas;
 pub mod session;
+pub mod sync;
 
 // Copy of the ruma Response type; the origninal type does not
 // implement Serialize.
@@ -22,10 +23,12 @@ pub(crate) struct WhoamiResponse {
     pub(crate) is_guest: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct Client {
     inner: MatrixClient,
     user_id: OwnedUserId,
     device_name: String,
+    pub sliding_sync: Option<SlidingSync>,
 }
 
 impl Client {
@@ -35,7 +38,7 @@ impl Client {
 
     pub(crate) async fn connect(&self) -> anyhow::Result<()> {
         if let Ok(Some(session)) = session::load_session(&self.user_id) {
-            self.inner.restore_session(session).await?;
+            self.inner.matrix_auth().restore_session(session).await?;
         }
 
         Ok(())
